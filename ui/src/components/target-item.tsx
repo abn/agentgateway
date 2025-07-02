@@ -24,6 +24,8 @@ export const getTargetType = (target: TargetWithType): TargetType => {
       return "stdio";
     case "sse":
       return "sse";
+    case "streamable_http":
+      return "streamable_http";
     default:
       return "unknown";
   }
@@ -52,6 +54,7 @@ export default function TargetItem({
                   {target.stdio && `${target.stdio.cmd} ${target.stdio.args?.join(" ")}`}
                   {target.openapi && `${target.openapi.host}:${target.openapi.port}`}
                   {target.a2a && `${target.a2a.host}:${target.a2a.port}${target.a2a.path}`}
+                  {target.streamable_http && `${target.streamable_http.host}:${target.streamable_http.port}${target.streamable_http.path}`}
                 </div>
               </TooltipTrigger>
               <TooltipContent>
@@ -59,6 +62,7 @@ export default function TargetItem({
                 {target.stdio && `${target.stdio.cmd} ${target.stdio.args?.join(" ")}`}
                 {target.openapi && `${target.openapi.host}:${target.openapi.port}`}
                 {target.a2a && `${target.a2a.host}:${target.a2a.port}${target.a2a.path}`}
+                {target.streamable_http && `${target.streamable_http.host}:${target.streamable_http.port}${target.streamable_http.path}`}
               </TooltipContent>
             </Tooltip>
           </TooltipProvider>

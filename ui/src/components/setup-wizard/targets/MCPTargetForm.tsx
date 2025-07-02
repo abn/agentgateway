@@ -1,10 +1,11 @@
 import { useState, useEffect, forwardRef, useImperativeHandle, useRef } from "react";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Globe2, Terminal, ServerIcon } from "lucide-react";
+import { Globe2, Terminal, ServerIcon, Workflow } from "lucide-react"; // Added Workflow
 import { SSETargetForm } from "./SSETargetForm";
 import { StdioTargetForm } from "./StdioTargetForm";
 import { OpenAPITargetForm } from "./OpenAPITargetForm";
+import { StreamableHttpTargetForm } from "./StreamableHttpTargetForm"; // Added StreamableHttpTargetForm
 import { TargetType, TargetWithType } from "@/lib/types";
 
 interface MCPTargetFormProps {
@@ -23,6 +24,7 @@ export const MCPTargetForm = forwardRef<{ submitForm: () => Promise<void> }, MCP
     const sseFormRef = useRef<{ submitForm: () => Promise<void> } | null>(null);
     const stdioFormRef = useRef<{ submitForm: () => Promise<void> } | null>(null);
     const openApiFormRef = useRef<{ submitForm: () => Promise<void> } | null>(null);
+    const streamableHttpFormRef = useRef<{ submitForm: () => Promise<void> } | null>(null); // Added streamableHttpFormRef
 
     // Initialize target type based on existing target if available
     function getInitialTargetType(target?: TargetWithType): TargetType {
@@ -30,6 +32,7 @@ export const MCPTargetForm = forwardRef<{ submitForm: () => Promise<void> }, MCP
         if (target.stdio) return "stdio";
         if (target.openapi) return "openapi";
         if (target.sse) return "sse";
+        if (target.streamable_http) return "streamable_http"; // Added streamable_http check
       }
       return "sse"; // Default to SSE if no existing target
     }
@@ -54,6 +57,9 @@ export const MCPTargetForm = forwardRef<{ submitForm: () => Promise<void> }, MCP
             case "openapi":
               if (openApiFormRef.current) await openApiFormRef.current.submitForm();
               break;
+            case "streamable_http": // Added streamable_http case
+              if (streamableHttpFormRef.current) await streamableHttpFormRef.current.submitForm();
+              break;
           }
         },
       }),
@@ -69,7 +75,7 @@ export const MCPTargetForm = forwardRef<{ submitForm: () => Promise<void> }, MCP
             value={targetType}
             onValueChange={(value) => setTargetType(value as TargetType)}
           >
-            <TabsList className="grid w-full grid-cols-3">
+            <TabsList className="grid w-full grid-cols-4"> {/* Changed grid-cols-3 to grid-cols-4 */}
               <TabsTrigger value="sse" className="flex items-center">
                 <Globe2 className="h-4 w-4 mr-2" />
                 SSE
@@ -81,6 +87,10 @@ export const MCPTargetForm = forwardRef<{ submitForm: () => Promise<void> }, MCP
               <TabsTrigger value="openapi" className="flex items-center">
                 <ServerIcon className="h-4 w-4 mr-2" />
                 OpenAPI
+              </TabsTrigger>
+              <TabsTrigger value="streamable_http" className="flex items-center"> {/* Added Streamable HTTP Tab */}
+                <Workflow className="h-4 w-4 mr-2" />
+                Streamable HTTP
               </TabsTrigger>
             </TabsList>
 
@@ -114,6 +124,17 @@ export const MCPTargetForm = forwardRef<{ submitForm: () => Promise<void> }, MCP
                 existingTarget={existingTarget}
                 hideSubmitButton={true}
                 ref={openApiFormRef}
+              />
+            </TabsContent>
+
+            <TabsContent value="streamable_http"> {/* Added Streamable HTTP Tab Content */}
+              <StreamableHttpTargetForm
+                targetName={targetName}
+                onSubmit={onSubmit}
+                isLoading={isLoading}
+                existingTarget={existingTarget}
+                hideSubmitButton={true}
+                ref={streamableHttpFormRef}
               />
             </TabsContent>
           </Tabs>

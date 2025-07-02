@@ -4,8 +4,8 @@ use crate::proto::agentgateway::dev::common::BackendAuth as XdsAuth;
 use crate::proto::agentgateway::dev::common::BackendTls as XdsTls;
 use crate::proto::agentgateway::dev::mcp::target::{
 	Target as McpXdsTarget, target::Filter as XdsFilter, target::OpenApiTarget as XdsOpenAPITarget,
-	target::SseTarget as XdsSseTarget, target::Target as XdsTarget,
-	target::filter::Matcher as XdsFitlerMatcher,
+	target::SseTarget as XdsSseTarget, target::StreamableHttpTarget as XdsStreamableHttpTarget,
+	target::Target as XdsTarget, target::filter::Matcher as XdsFitlerMatcher,
 	target::open_api_target::SchemaSource as ProtoSchemaSource,
 };
 use crate::relay::{Filter, FilterMatcher};
@@ -67,6 +67,65 @@ impl TryFrom<McpXdsTarget> for Target<McpTargetSpec> {
 	}
 }
 
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::proto::agentgateway::dev::common::{
+		Header as XdsHeader, KeyValue, ValueSource,
+	};
+	use crate::proto::agentgateway::dev::mcp::target::StreamableHttpTarget as XdsStreamableHttpTarget;
+
+	#[test]
+	fn test_try_from_xds_streamable_http_target() {
+		let xds_target = XdsStreamableHttpTarget {
+			host: "localhost".to_string(),
+			port: 8080,
+			path: "/mcp".to_string(),
+			headers: vec![XdsHeader {
+				key: "X-Test".to_string(),
+				value: Some(ValueSource {
+					value: Some(KeyValue::StringValue("test-value".to_string())),
+				}),
+			}],
+			auth: None,
+			tls: None,
+		};
+
+		let spec: StreamableHttpTargetSpec = xds_target.try_into().unwrap();
+
+		assert_eq!(spec.host, "localhost");
+		assert_eq!(spec.port, 8080);
+		assert_eq!(spec.path, "/mcp");
+		assert_eq!(spec.headers.get("X-Test").unwrap(), "test-value");
+		assert!(spec.backend_auth.is_none());
+		assert!(spec.tls.is_none());
+	}
+
+	#[test]
+	fn test_try_from_xds_target_to_mcp_spec_streamable_http() {
+		let xds_streamable_target = XdsStreamableHttpTarget {
+			host: "example.com".to_string(),
+			port: 9000,
+			path: "/test_mcp".to_string(),
+			headers: vec![],
+			auth: None,
+			tls: None,
+		};
+
+		let xds_target = XdsTarget::StreamableHttp(xds_streamable_target);
+		let mcp_spec: McpTargetSpec = xds_target.try_into().unwrap();
+
+		match mcp_spec {
+			McpTargetSpec::StreamableHttp(spec) => {
+				assert_eq!(spec.host, "example.com");
+				assert_eq!(spec.port, 9000);
+				assert_eq!(spec.path, "/test_mcp");
+			}
+			_ => panic!("McpTargetSpec should be StreamableHttp"),
+		}
+	}
+}
+
 impl TryFrom<XdsFilter> for Filter {
 	type Error = anyhow::Error;
 
@@ -93,6 +152,7 @@ pub enum McpTargetSpec {
 		env: HashMap<String, String>,
 	},
 	OpenAPI(OpenAPITarget),
+	StreamableHttp(StreamableHttpTargetSpec),
 }
 
 impl TryFrom<XdsTarget> for McpTargetSpec {
@@ -107,6 +167,9 @@ impl TryFrom<XdsTarget> for McpTargetSpec {
 				env: stdio.env,
 			},
 			XdsTarget::Openapi(openapi) => McpTargetSpec::OpenAPI(openapi.try_into()?),
+			XdsTarget::StreamableHttp(streamable_http) => {
+				McpTargetSpec::StreamableHttp(streamable_http.try_into()?)
+			}
 		};
 		Ok(target)
 	}
@@ -161,6 +224,61 @@ pub struct SseTargetSpec {
 	pub backend_auth: Option<backend::BackendAuthConfig>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub tls: Option<TlsConfig>,
+}
+
+impl TryFrom<XdsSseTarget> for SseTargetSpec {
+	type Error = anyhow::Error;
+
+	fn try_from(value: XdsSseTarget) -> Result<Self, Self::Error> {
+		Ok(SseTargetSpec {
+			host: value.host,
+			port: value.port,
+			path: value.path,
+			headers: proto::resolve_header_map(&value.headers)?,
+			backend_auth: match value.auth {
+				Some(auth) => XdsAuth::try_into(auth)?,
+				None => None,
+			},
+			tls: match value.tls {
+				Some(tls) => Some(TlsConfig::try_from(tls)?),
+				None => None,
+			},
+		})
+	}
+}
+
+#[derive(Clone, Serialize, Debug)]
+pub struct StreamableHttpTargetSpec {
+	pub host: String,
+	pub port: u32,
+	pub path: String,
+	#[serde(skip_serializing_if = "HashMap::is_empty")]
+	pub headers: HashMap<String, String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub backend_auth: Option<backend::BackendAuthConfig>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub tls: Option<TlsConfig>,
+}
+
+impl TryFrom<XdsStreamableHttpTarget> for StreamableHttpTargetSpec {
+	type Error = anyhow::Error;
+
+	fn try_from(value: XdsStreamableHttpTarget) -> Result<Self, Self::Error> {
+		Ok(StreamableHttpTargetSpec {
+			host: value.host,
+			port: value.port,
+			path: value.path,
+			headers: proto::resolve_header_map(&value.headers)?,
+			backend_auth: match value.auth {
+				Some(auth) => XdsAuth::try_into(auth)?,
+				None => None,
+			},
+			tls: match value.tls {
+				Some(tls) => Some(TlsConfig::try_from(tls)?),
+				None => None,
+			},
+		})
+	}
 }
 
 #[derive(Clone, Serialize, Debug)]

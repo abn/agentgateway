@@ -12,11 +12,27 @@ export interface Target {
   openapi?: OpenAPITarget;
   stdio?: StdioTarget;
   a2a?: A2aTarget;
+  streamable_http?: StreamableHttpTarget;
 }
 
-export type TargetType = "mcp" | "sse" | "openapi" | "stdio" | "a2a" | "unknown";
+export type TargetType = "mcp" | "sse" | "openapi" | "stdio" | "a2a" | "streamable_http" | "unknown";
 
 export interface SseTarget {
+  // The host of the target.
+  host: string;
+  // The port of the target.
+  port: number;
+  // The path of the target.
+  path: string;
+  // The headers of the target.
+  headers?: Header[];
+  // The auth of the target.
+  auth?: BackendAuth;
+  // The tls of the target.
+  tls?: BackendTls;
+}
+
+export interface StreamableHttpTarget {
   // The host of the target.
   host: string;
   // The port of the target.
@@ -191,7 +207,7 @@ export interface Config {
   targets: TargetWithType[];
 }
 
-export type TargetWithType = Target & { type: "mcp" | "a2a" | "openapi" | "stdio" | "sse" };
+export type TargetWithType = Target & { type: "mcp" | "a2a" | "openapi" | "stdio" | "sse" | "streamable_http" };
 
 // Schema specifically for Playground UI representation, might differ from backend config Listener
 export const PlaygroundListenerSchema = z.object({

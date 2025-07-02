@@ -18,6 +18,7 @@ message Target {
     SseTarget sse = 3;
     OpenAPITarget openapi = 4;
     StdioTarget stdio = 5;
+    StreamableHttpTarget streamable_http = 7; // Next available number
   }
 
   message Filter {
@@ -90,6 +91,21 @@ message Target {
     agentgateway.dev.common.BackendTls tls = 5;
 
     repeated agentgateway.dev.common.Header headers = 6;
+  }
+
+  message StreamableHttpTarget {
+    // The host of the MCP server.
+    string host = 1;
+    // The port of the MCP server.
+    uint32 port = 2;
+    // The MCP endpoint path.
+    string path = 3;
+    // Headers to include in requests to the MCP server.
+    repeated agentgateway.dev.common.Header headers = 4;
+    // Authentication configuration.
+    agentgateway.dev.common.BackendAuth auth = 5;
+    // TLS configuration.
+    agentgateway.dev.common.BackendTls tls = 6;
   }
 }
 
