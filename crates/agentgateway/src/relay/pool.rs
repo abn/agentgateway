@@ -3,13 +3,37 @@ use crate::outbound;
 use crate::proto::agentgateway::dev::mcp::target::target::OpenApiTarget as ProtoXdsOpenApiTarget;
 
 use super::*;
-use futures::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
+use futures::StreamExt; // Removed BoxFuture, FutureExt
 use reqwest::{Client as HttpClient, IntoUrl, Url, header::ACCEPT};
-use rmcp::model::ClientJsonRpcMessage;
-use rmcp::service::{Peer, serve_client_with_ct};
-use rmcp::transport::sse::{SseClient, SseTransportError};
-use rmcp::{ClientHandler, ServiceError};
+use rmcp::service::{Peer, serve_client_with_ct, NotificationContext, RequestContext};
+use rmcp::transport::sse_client::{SseClient, SseTransportError, SseClientConfig};
+use rmcp::transport::common::client_side_sse::FixedInterval;
+use rmcp::transport::SseClientTransport;
+use rmcp::{ClientHandler, ServiceError, Error as McpError, RoleClient, RoleServer};
+use rmcp::model::{
+    ClientRequest, ClientResult, ClientNotification, JsonRpcMessage,
+    CreateMessageRequestParam, CreateMessageResult, ListRootsResult,
+    CancelledNotificationParam, ProgressNotificationParam, LoggingMessageNotificationParam,
+    ResourceUpdatedNotificationParam,
+    // For OpenAPI part of connect method:
+    InitializeResult, ListToolsResult, CallToolRequestParam, CallToolResult, Content, RequestId,
+    // ServerResult, // Removed based on warnings/usage check
+    // PaginatedRequestParam, // Removed based on warnings/usage check
+    // Request as ModelRequest, // Removed based on warnings
+    // Extensions, GetExtensions, GetMeta, ServerInfo, ClientInfo, // Removed based on warnings
+    // InitializeRequest, InitializeRequestParam, // Removed based on warnings (InitializeResult is kept)
+    // ListToolsRequest, ListPromptsRequest, ListResourcesRequest, ListResourceTemplatesRequest, // Removed
+    // ReadResourceRequest, ReadResourceRequestParam, ReadResourceResult // Removed
+};
 use sse_stream::{Error as SseError, Sse, SseStream};
+use http::Uri;
+// use std::pin::Pin; // Unused
+use futures::stream::BoxStream; // Keep BoxStream as it's used, remove Stream
+use futures::Future;
+use std::sync::Arc;
+use tokio::process::Command;
+use http::{HeaderMap, HeaderName, HeaderValue, header::AUTHORIZATION}; // For ReqwestSseClient if headers were added back
+
 
 pub(crate) struct ConnectionPool {
 	listener_name: String,
@@ -32,9 +56,7 @@ impl ConnectionPool {
 		peer: &Peer<RoleServer>,
 		name: &str,
 	) -> anyhow::Result<&upstream::UpstreamTarget> {
-		// Connect if it doesn't exist
 		if !self.by_name.contains_key(name) {
-			// Read target info and drop lock before calling connect
 			let target_info: Option<(
 				outbound::Target<outbound::McpTargetSpec>,
 				tokio_util::sync::CancellationToken,
@@ -47,10 +69,8 @@ impl ConnectionPool {
 			};
 
 			if let Some((target, ct)) = target_info {
-				// Now self is not immutably borrowed by state lock
 				self.connect(rq_ctx, &ct, &target, peer).await?;
 			} else {
-				// Handle target not found in state configuration
 				return Err(anyhow::anyhow!(
 					"Target configuration not found for {}",
 					name
@@ -73,9 +93,6 @@ impl ConnectionPool {
 		rq_ctx: &RqCtx,
 		peer: &Peer<RoleServer>,
 	) -> anyhow::Result<Vec<(String, &upstream::UpstreamTarget)>> {
-		// Iterate through all state targets, and get the connection from the pool
-		// If the connection is not in the pool, connect to it and add it to the pool
-		// 1. Get target configurations (name, Target, CancellationToken) from the state's TargetStore
 		let targets_config: Vec<(
 			String,
 			(
@@ -84,7 +101,6 @@ impl ConnectionPool {
 			),
 		)> = {
 			let state = self.state.read().await;
-			// Iterate the underlying HashMap directly to get the full tuple
 			state
 				.mcp_targets
 				.iter(&self.listener_name)
@@ -92,7 +108,6 @@ impl ConnectionPool {
 				.collect()
 		};
 
-		// 2. Identify targets needing connection without holding lock or borrowing self mutably yet
 		let mut connections_to_make = Vec::new();
 		for (name, (target, ct)) in &targets_config {
 			if !self.by_name.contains_key(name) {
@@ -100,7 +115,6 @@ impl ConnectionPool {
 			}
 		}
 
-		// 3. Connect the missing ones (self is borrowed mutably here)
 		for (name, target, ct) in connections_to_make {
 			tracing::debug!("Connecting missing target: {}", name);
 			self
@@ -108,12 +122,11 @@ impl ConnectionPool {
 				.await
 				.map_err(|e| {
 					tracing::error!("Failed to connect target {}: {}", name, e);
-					e // Propagate error
+					e
 				})?;
 		}
 		tracing::debug!("Finished connecting missing targets.");
 
-		// 4. Collect all required connections from the pool
 		let results = targets_config
 			.into_iter()
 			.filter_map(|(name, _)| {
@@ -141,12 +154,11 @@ impl ConnectionPool {
 		target: &outbound::Target<outbound::McpTargetSpec>,
 		peer: &Peer<RoleServer>,
 	) -> Result<(), anyhow::Error> {
-		// Already connected
 		if let Some(_transport) = self.by_name.get(&target.name) {
 			return Ok(());
 		}
 		tracing::trace!("connecting to target: {}", target.name);
-		let transport: upstream::UpstreamTarget = match &target.spec {
+		let transport_to_insert: upstream::UpstreamTarget = match &target.spec {
 			McpTargetSpec::Sse(sse) => {
 				tracing::debug!("starting sse transport for target: {}", target.name);
 				let path = match sse.path.as_str() {
@@ -156,7 +168,7 @@ impl ConnectionPool {
 				let builder = reqwest::Client::builder();
 				let (scheme, builder) = tls_cfg(builder, &sse.tls, sse.port).await?;
 
-				let url = format!("{}://{}:{}{}", scheme, sse.host, sse.port, path);
+				let url_str = format!("{}://{}:{}{}", scheme, sse.host, sse.port, path);
 				let mut upstream_headers = get_default_headers(&sse.backend_auth, rq_ctx).await?;
 				for (key, value) in sse.headers.iter() {
 					upstream_headers.insert(
@@ -164,9 +176,15 @@ impl ConnectionPool {
 						HeaderValue::from_str(value)?,
 					);
 				}
-				let client = builder.default_headers(upstream_headers).build()?;
-				let client = ReqwestSseClient::new_with_client(url.as_str(), client).await?;
-				let transport = SseTransport::start_with_client(client).await?;
+				let http_client = builder.default_headers(upstream_headers).build()?;
+				let sse_client_for_transport = ReqwestSseClient::new_with_client(url_str.as_str(), http_client).await?;
+
+                let sse_client_config = SseClientConfig {
+                    sse_endpoint: Arc::from(url_str.as_str()),
+                    retry_policy: Arc::new(FixedInterval::default()),
+                    use_message_endpoint: None,
+                };
+				let transport_to_serve = SseClientTransport::start_with_client(sse_client_for_transport, sse_client_config).await?;
 
 				upstream::UpstreamTarget {
 					filters: target.filters.clone(),
@@ -174,9 +192,8 @@ impl ConnectionPool {
 						serve_client_with_ct(
 							PeerClientHandler {
 								peer: peer.clone(),
-								peer_client: None,
 							},
-							transport,
+							transport_to_serve,
 							ct.child_token(),
 						)
 						.await?,
@@ -191,9 +208,11 @@ impl ConnectionPool {
 						serve_client_with_ct(
 							PeerClientHandler {
 								peer: peer.clone(),
-								peer_client: None,
+							}, {
+								let mut command = Command::new(cmd);
+								command.args(args);
+								TokioChildProcess::new(command)?
 							},
-							TokioChildProcess::new(Command::new(cmd).args(args))?,
 							ct.child_token(),
 						)
 						.await?,
@@ -201,10 +220,7 @@ impl ConnectionPool {
 				}
 			},
 			McpTargetSpec::OpenAPI(openapi_target_spec_from_outbound) => {
-				// Renamed for clarity
 				tracing::debug!("starting OpenAPI transport for target: {}", target.name);
-
-				// 1. Retrieve schema_source
 				let current_schema_source_proto = openapi_target_spec_from_outbound
 					.schema_source
 					.clone()
@@ -214,18 +230,14 @@ impl ConnectionPool {
 						target.name
 					)
 				})?;
-
-				// 2. Prepare for load_openapi_schema
 				let proto_target_for_loading = ProtoXdsOpenApiTarget {
 					host: openapi_target_spec_from_outbound.host.clone(),
 					port: openapi_target_spec_from_outbound.port,
 					schema_source: Some(current_schema_source_proto),
-					auth: None,      // Not needed for schema loading
-					tls: None,       // Not needed for schema loading
-					headers: vec![], // Not needed for schema loading
+					auth: None,
+					tls: None,
+					headers: vec![],
 				};
-
-				// 3. Call load_openapi_schema
 				let loaded_openapi_doc =
 					crate::outbound::openapi::load_openapi_schema(&proto_target_for_loading)
 						.await
@@ -236,8 +248,6 @@ impl ConnectionPool {
 								e
 							)
 						})?;
-
-				// 4. Parse Tools and Server Info
 				let tools =
 					crate::outbound::openapi::parse_openapi_schema(&loaded_openapi_doc).map_err(|e| {
 						anyhow::anyhow!(
@@ -254,20 +264,13 @@ impl ConnectionPool {
 							e
 						)
 					})?;
-
-				// 5. Determine final server configuration and build client
 				let (final_scheme, final_host, final_port, final_prefix, builder) =
 					if server_info.scheme.is_some() {
-						// Full URL provided in OpenAPI server - use that completely
 						let host = server_info.host.unwrap();
-						let port = server_info.port; // ServerInfo always provides port
-
-						// Configure TLS for the full URL's port and scheme
+						let port = server_info.port;
 						let builder = reqwest::Client::builder();
 						let (verified_scheme, configured_builder) =
 							tls_cfg(builder, &openapi_target_spec_from_outbound.tls, port).await?;
-
-						// Use the verified scheme from tls_cfg (should match our parsed scheme)
 						(
 							verified_scheme,
 							host,
@@ -276,7 +279,6 @@ impl ConnectionPool {
 							configured_builder,
 						)
 					} else {
-						// Just a path prefix - use config for scheme/host/port
 						let builder = reqwest::Client::builder();
 						let (scheme, configured_builder) = tls_cfg(
 							builder,
@@ -292,8 +294,6 @@ impl ConnectionPool {
 							configured_builder,
 						)
 					};
-
-				// 6. Add headers and build final client
 				let mut api_headers =
 					get_default_headers(&openapi_target_spec_from_outbound.backend_auth, rq_ctx).await?;
 				for (key, value) in &openapi_target_spec_from_outbound.headers {
@@ -303,13 +303,12 @@ impl ConnectionPool {
 					);
 				}
 				let final_client = builder.default_headers(api_headers).build()?;
-
 				upstream::UpstreamTarget {
-					filters: target.filters.clone(), // From the outer 'target' variable
+					filters: target.filters.clone(),
 					spec: upstream::UpstreamTargetSpec::OpenAPI(crate::outbound::openapi::Handler {
 						host: final_host,
 						client: final_client,
-						tools, // From parse_openapi_schema
+						tools,
 						scheme: final_scheme,
 						prefix: final_prefix,
 						port: final_port,
@@ -317,7 +316,7 @@ impl ConnectionPool {
 				}
 			},
 		};
-		self.by_name.insert(target.name.clone(), transport);
+		self.by_name.insert(target.name.clone(), transport_to_insert);
 		Ok(())
 	}
 }
@@ -332,17 +331,17 @@ async fn tls_cfg(
 			let builder = builder.https_only(true);
 			Ok(("https".to_string(), builder))
 		},
-		(443, Some(tls)) => {
+		(443, Some(tls_config)) => {
 			let builder = builder
 				.https_only(true)
-				.danger_accept_invalid_hostnames(tls.insecure_skip_verify);
+				.danger_accept_invalid_hostnames(tls_config.insecure_skip_verify);
 			Ok(("https".to_string(), builder))
 		},
 		(_, None) => Ok(("http".to_string(), builder)),
-		(_, Some(tls)) => {
+		(_, Some(tls_config)) => {
 			let builder = builder
 				.https_only(false)
-				.danger_accept_invalid_hostnames(tls.insecure_skip_verify);
+				.danger_accept_invalid_hostnames(tls_config.insecure_skip_verify);
 			Ok(("https".to_string(), builder))
 		},
 	}
@@ -351,7 +350,7 @@ async fn tls_cfg(
 #[derive(Debug, Clone)]
 pub(crate) struct PeerClientHandler {
 	peer: Peer<RoleServer>,
-	peer_client: Option<Peer<RoleClient>>,
+	// peer_client: Option<Peer<RoleClient>>, // Unused after removing set_peer/get_peer
 }
 
 impl ClientHandler for PeerClientHandler {
@@ -361,7 +360,7 @@ impl ClientHandler for PeerClientHandler {
 		_context: RequestContext<RoleClient>,
 	) -> Result<CreateMessageResult, McpError> {
 		self.peer.create_message(params).await.map_err(|e| match e {
-			ServiceError::McpError(e) => e,
+			ServiceError::McpError(mcp_error) => mcp_error,
 			_ => McpError::internal_error(e.to_string(), None),
 		})
 	}
@@ -371,24 +370,24 @@ impl ClientHandler for PeerClientHandler {
 		_context: RequestContext<RoleClient>,
 	) -> Result<ListRootsResult, McpError> {
 		self.peer.list_roots().await.map_err(|e| match e {
-			ServiceError::McpError(e) => e,
+			ServiceError::McpError(mcp_error) => mcp_error,
 			_ => McpError::internal_error(e.to_string(), None),
 		})
 	}
 
-	async fn on_cancelled(&self, params: CancelledNotificationParam) {
+	async fn on_cancelled(&self, params: CancelledNotificationParam, _context: NotificationContext<RoleClient>) {
 		let _ = self.peer.notify_cancelled(params).await.inspect_err(|e| {
 			tracing::error!("Failed to notify cancelled: {}", e);
 		});
 	}
 
-	async fn on_progress(&self, params: ProgressNotificationParam) {
+	async fn on_progress(&self, params: ProgressNotificationParam, _context: NotificationContext<RoleClient>) {
 		let _ = self.peer.notify_progress(params).await.inspect_err(|e| {
 			tracing::error!("Failed to notify progress: {}", e);
 		});
 	}
 
-	async fn on_logging_message(&self, params: LoggingMessageNotificationParam) {
+	async fn on_logging_message(&self, params: LoggingMessageNotificationParam, _context: NotificationContext<RoleClient>) {
 		let _ = self
 			.peer
 			.notify_logging_message(params)
@@ -398,7 +397,7 @@ impl ClientHandler for PeerClientHandler {
 			});
 	}
 
-	async fn on_prompt_list_changed(&self) {
+	async fn on_prompt_list_changed(&self, _context: NotificationContext<RoleClient>) {
 		let _ = self
 			.peer
 			.notify_prompt_list_changed()
@@ -408,7 +407,7 @@ impl ClientHandler for PeerClientHandler {
 			});
 	}
 
-	async fn on_resource_list_changed(&self) {
+	async fn on_resource_list_changed(&self, _context: NotificationContext<RoleClient>) {
 		let _ = self
 			.peer
 			.notify_resource_list_changed()
@@ -418,13 +417,13 @@ impl ClientHandler for PeerClientHandler {
 			});
 	}
 
-	async fn on_tool_list_changed(&self) {
+	async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
 		let _ = self.peer.notify_tool_list_changed().await.inspect_err(|e| {
 			tracing::error!("Failed to notify tool list changed: {}", e);
 		});
 	}
 
-	async fn on_resource_updated(&self, params: ResourceUpdatedNotificationParam) {
+	async fn on_resource_updated(&self, params: ResourceUpdatedNotificationParam, _context: NotificationContext<RoleClient>) {
 		let _ = self
 			.peer
 			.notify_resource_updated(params)
@@ -433,14 +432,6 @@ impl ClientHandler for PeerClientHandler {
 				tracing::error!("Failed to notify resource updated: {}", e);
 			});
 	}
-
-	fn set_peer(&mut self, peer: Peer<RoleClient>) {
-		self.peer_client = Some(peer);
-	}
-
-	fn get_peer(&self) -> Option<Peer<RoleClient>> {
-		self.peer_client.clone()
-	}
 }
 
 async fn get_default_headers(
@@ -448,8 +439,8 @@ async fn get_default_headers(
 	rq_ctx: &RqCtx,
 ) -> Result<HeaderMap, anyhow::Error> {
 	match auth_config {
-		Some(auth_config) => {
-			let backend_auth = auth_config.build(&rq_ctx.identity).await?;
+		Some(auth_config_val) => {
+			let backend_auth = auth_config_val.build(&rq_ctx.identity).await?;
 			let token = backend_auth.get_token().await?;
 			let mut upstream_headers = HeaderMap::new();
 			let auth_value = HeaderValue::from_str(&format!("Bearer {}", token))?;
@@ -459,10 +450,6 @@ async fn get_default_headers(
 		None => Ok(HeaderMap::new()),
 	}
 }
-
-// This is mostly a copy/paste of the upstream ReqwestSseClient, but with the
-// ability to dynamically add headers per-request. For example tracing headers,
-// or custom headers for the backend.
 
 #[derive(Clone)]
 pub struct ReqwestSseClient {
@@ -486,76 +473,74 @@ impl ReqwestSseClient {
 	}
 }
 
-const MIME_TYPE: &str = "text/event-stream";
-const HEADER_LAST_EVENT_ID: &str = "Last-Event-ID";
+// Constants for SseClient implementation
+const MIME_TYPE_EVENT_STREAM: &str = "text/event-stream";
+const MIME_TYPE_JSON: &str = "application/json";
 
-impl SseClient<reqwest::Error> for ReqwestSseClient {
-	fn connect(
-		&self,
-		last_event_id: Option<String>,
-	) -> BoxFuture<
-		'static,
-		Result<BoxStream<'static, Result<Sse, SseError>>, SseTransportError<reqwest::Error>>,
-	> {
-		let client = self.http_client.clone();
-		let sse_url = self.sse_url.as_ref().to_string();
-		let last_event_id = last_event_id.clone();
-		let fut = async move {
-			let mut request_builder = client.get(&sse_url).header(ACCEPT, MIME_TYPE);
-			if let Some(last_event_id) = last_event_id {
-				request_builder = request_builder.header(HEADER_LAST_EVENT_ID, last_event_id);
-			}
-			let response = request_builder.send().await?;
-			let response = response.error_for_status()?;
-			match response.headers().get(reqwest::header::CONTENT_TYPE) {
-				Some(ct) => {
-					if !ct.as_bytes().starts_with(MIME_TYPE.as_bytes()) {
-						return Err(SseTransportError::UnexpectedContentType(Some(ct.clone())));
-					}
-				},
-				None => {
-					return Err(SseTransportError::UnexpectedContentType(None));
-				},
-			}
-			let event_stream = SseStream::from_byte_stream(response.bytes_stream()).boxed();
-			Ok(event_stream)
-		};
-		fut.boxed()
-	}
+impl SseClient for ReqwestSseClient {
+    type Error = reqwest::Error;
 
-	fn post(
-		&self,
-		session_id: &str,
-		message: ClientJsonRpcMessage,
-	) -> BoxFuture<'static, Result<(), SseTransportError<reqwest::Error>>> {
-		let client = self.http_client.clone();
-		let sse_url = self.sse_url.clone();
-		let session_id = session_id.to_string();
-		Box::pin(async move {
-			let mut headers = HeaderMap::new();
-			if let ClientJsonRpcMessage::Request(req) = &message {
-				match req.request.extensions().get::<RqCtx>() {
-					Some(rq_ctx) => {
-						let tracer = trcng::get_tracer();
-						let _span = tracer
-							.span_builder("sse_post")
-							.with_kind(SpanKind::Client)
-							.start_with_context(tracer, &rq_ctx.context);
-						trcng::add_context_to_request(&mut headers, &rq_ctx.context);
-					},
-					None => {
-						tracing::trace!("No RqCtx found in extensions");
-					},
-				}
-			}
-			let uri = sse_url.join(&session_id).map_err(SseTransportError::from)?;
-			let request_builder = client.post(uri.as_ref()).json(&message).headers(headers);
-			request_builder
-				.send()
-				.await
-				.and_then(|resp| resp.error_for_status())
-				.map_err(SseTransportError::from)
-				.map(drop)
-		})
-	}
+    fn get_stream(
+        &self,
+        _uri: Uri,
+        last_event_id: Option<String>,
+        _auth_token: Option<String>,
+    ) -> impl Future<Output = Result<BoxStream<'static, Result<Sse, SseError>>, SseTransportError<Self::Error>>> + Send + '_ {
+        let client = self.http_client.clone();
+        let sse_url_str = self.sse_url.to_string();
+
+        async move {
+            let mut request_builder = client.get(sse_url_str)
+                .header(ACCEPT, MIME_TYPE_EVENT_STREAM);
+
+            if let Some(leid) = last_event_id {
+                request_builder = request_builder.header("Last-Event-ID", leid);
+            }
+
+            let response = request_builder.send().await?;
+            let response = response.error_for_status()?;
+
+            match response.headers().get(reqwest::header::CONTENT_TYPE) {
+                Some(ct) => {
+                    if !ct.as_bytes().starts_with(MIME_TYPE_EVENT_STREAM.as_bytes()) {
+                        return Err(SseTransportError::UnexpectedContentType(Some(ct.clone())));
+                    }
+                }
+                None => {
+                    return Err(SseTransportError::UnexpectedContentType(None));
+                }
+            }
+            let event_stream = SseStream::from_byte_stream(response.bytes_stream()).boxed();
+            Ok(event_stream)
+        }
+    }
+
+    fn post_message(
+        &self,
+        _uri: Uri,
+        message: JsonRpcMessage<ClientRequest, ClientResult, ClientNotification>,
+        _auth_token: Option<String>,
+    ) -> impl Future<Output = Result<(), SseTransportError<Self::Error>>> + Send + '_ {
+        let client = self.http_client.clone();
+        let mcp_endpoint_url = self.sse_url.clone();
+
+        async move {
+            // RqCtx and custom header logic temporarily removed.
+            // A HeaderMap can be created here if other default headers are needed.
+            // let mut headers = HeaderMap::new();
+
+            let request_builder = client.post(mcp_endpoint_url)
+                .header(ACCEPT, format!("{}, {}", MIME_TYPE_JSON, MIME_TYPE_EVENT_STREAM))
+                .json(&message);
+                // .headers(headers); // Removed if headers is not used
+
+            request_builder
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await?;
+            Ok(())
+        }
+    }
 }

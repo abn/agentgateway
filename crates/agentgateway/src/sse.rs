@@ -26,13 +26,17 @@ use futures::{SinkExt, StreamExt, stream::Stream};
 use rmcp::{
 	model::{ClientJsonRpcMessage, GetExtensions, JsonRpcBatchRequestItem},
 	service::serve_server_with_ct,
-	transport::common::axum::session_id as generate_streamable_session_id,
-	transport::streamable_http_server::session::{
-		self, EventId, HEADER_LAST_EVENT_ID, HEADER_SESSION_ID, Session, SessionId,
-		StreamableHttpMessageReceiver,
-	},
+	transport::common::server_side_http::session_id as generate_streamable_session_id,
+	transport::streamable_http_server::session::local::{create_local_session, EventId, LocalSessionHandle, SessionConfig, StreamableHttpMessageReceiver},
+	transport::streamable_http_server::session::SessionId,
 };
+use http::HeaderName;
 use serde_json::json;
+
+const LAST_EVENT_ID: HeaderName = HeaderName::from_static("last-event-id");
+
+// Define HEADER_SESSION_ID if it's custom and not in http::header
+const HEADER_SESSION_ID: HeaderName = HeaderName::from_static("session-id");
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,7 +44,7 @@ use tokio::io::{self};
 use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 
-type SessionManager = Arc<tokio::sync::RwLock<HashMap<SessionId, Session>>>;
+type SessionManager = Arc<tokio::sync::RwLock<HashMap<SessionId, LocalSessionHandle>>>;
 
 #[derive(Clone)]
 pub struct App {
@@ -289,7 +293,7 @@ fn mcp_receiver_as_stream(
 			Event::default()
 				.event("message")
 				.data(&bytes)
-				.id(message.event_id.to_string()),
+				.id(message.event_id.as_deref().unwrap_or_default()),
 		),
 		Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
 	})
@@ -332,17 +336,17 @@ async fn mcp_post_handler(
 
 	if let Some(session_id) = session_id_from_header {
 		tracing::debug!(%session_id, ?message, "new client message for /mcp existing session");
-		let handle = {
+		let session_handle = {
 			let sm = app.mcp_session_manager.read().await;
 			let session = sm
 				.get(session_id.as_str())
 				.ok_or_else(|| (StatusCode::NOT_FOUND, "Session not found".to_string()).into_response())?;
-			session.handle().clone()
+			session.clone()
 		};
 
 		match &message {
 			ClientJsonRpcMessage::Request(_) | ClientJsonRpcMessage::BatchRequest(_) => {
-				let receiver = handle.establish_request_wise_channel().await.map_err(|e| {
+				let receiver = session_handle.establish_request_wise_channel().await.map_err(|e| {
 					(
 						StatusCode::INTERNAL_SERVER_ERROR,
 						format!("Failed to establish request channel: {e}"),
@@ -350,7 +354,7 @@ async fn mcp_post_handler(
 						.into_response()
 				})?;
 				let http_request_id = receiver.http_request_id;
-				if let Err(push_err) = handle.push_message(message, http_request_id).await {
+				if let Err(push_err) = session_handle.push_message(message, http_request_id).await {
 					tracing::error!(%session_id, ?push_err, "Push message error for /mcp");
 					return Err(
 						(
@@ -368,7 +372,7 @@ async fn mcp_post_handler(
 				)
 			},
 			_ => {
-				let result = handle.push_message(message, None).await;
+				let result = session_handle.push_message(message, None).await;
 				if result.is_err() {
 					Err((StatusCode::GONE, "Session terminated".to_string()).into_response())
 				} else {
@@ -380,7 +384,7 @@ async fn mcp_post_handler(
 		let session_id = generate_streamable_session_id();
 		tracing::debug!(%session_id, ?message, "New client message for /mcp, creating session");
 
-		let (session, transport) = session::create_session(session_id.clone(), Default::default());
+		let (session_handle, session_worker_transport) = create_local_session(session_id.clone(), SessionConfig::default());
 
 		let policies = {
 			let state = app.state.read().await;
@@ -404,7 +408,7 @@ async fn mcp_post_handler(
 				policies,
 				app.listener_name.clone(),
 			);
-			let result = serve_server_with_ct(relay.clone(), transport, app.ct.child_token())
+			let result = serve_server_with_ct(relay.clone(), session_worker_transport, app.ct.child_token())
 				.await
 				.inspect_err(|e| {
 					tracing::error!("serving error: {:?}", e);
@@ -431,7 +435,7 @@ async fn mcp_post_handler(
 			}
 		});
 
-		let response_message = session.handle().initialize(message).await.map_err(|e| {
+		let response_message = session_handle.initialize(message).await.map_err(|e| {
 			(
 				StatusCode::INTERNAL_SERVER_ERROR,
 				format!("Failed to initialize session: {e}"),
@@ -455,7 +459,7 @@ async fn mcp_post_handler(
 			.mcp_session_manager
 			.write()
 			.await
-			.insert(session_id, session);
+			.insert(session_id, session_handle);
 		Ok(response)
 	}
 }
@@ -486,7 +490,7 @@ async fn mcp_get_handler(
 	if let Some(session_id_str) = session_id_from_header {
 		let session_id = session_id_str.to_string();
 		let last_event_id_str = headers
-			.get(HEADER_LAST_EVENT_ID)
+		.get(LAST_EVENT_ID)
 			.and_then(|v| v.to_str().ok());
 
 		match last_event_id_str {
@@ -494,21 +498,20 @@ async fn mcp_get_handler(
 				let last_event_id = last_event_id_val.parse::<EventId>().map_err(|e| {
 					(
 						StatusCode::BAD_REQUEST,
-						format!("Invalid {HEADER_LAST_EVENT_ID}: {e}"),
+					format!("Invalid {}: {e}", LAST_EVENT_ID.as_str()),
 					)
 						.into_response()
 				})?;
 				tracing::debug!(%session_id, ?last_event_id, "Resuming /mcp session");
 				let sm = app.mcp_session_manager.read().await;
-				let session = sm.get(session_id_str).ok_or_else(|| {
+				let session_handle = sm.get(session_id_str).ok_or_else(|| {
 					(
 						StatusCode::NOT_FOUND,
 						format!("Session {session_id} not found"),
 					)
 						.into_response()
 				})?;
-				let handle = session.handle();
-				let receiver = handle.resume(last_event_id).await.map_err(|e| {
+				let receiver = session_handle.resume(last_event_id).await.map_err(|e| {
 					(
 						StatusCode::INTERNAL_SERVER_ERROR,
 						format!("Resume error: {e}"),
@@ -521,15 +524,14 @@ async fn mcp_get_handler(
 			None => {
 				tracing::debug!(%session_id, "Establishing common channel for /mcp session");
 				let sm = app.mcp_session_manager.read().await;
-				let session = sm.get(session_id_str).ok_or_else(|| {
+				let session_handle = sm.get(session_id_str).ok_or_else(|| {
 					(
 						StatusCode::NOT_FOUND,
 						format!("Session {session_id} not found"),
 					)
 						.into_response()
 				})?;
-				let handle = session.handle();
-				let receiver = handle.establish_common_channel().await.map_err(|e| {
+				let receiver = session_handle.establish_common_channel().await.map_err(|e| {
 					(
 						StatusCode::INTERNAL_SERVER_ERROR,
 						format!("Establish common channel error: {e}"),
@@ -580,11 +582,11 @@ async fn mcp_delete_handler(
 		tracing::info!(%session_id, "Attempting to delete /mcp session");
 
 		let mut sm = app.mcp_session_manager.write().await;
-		let session = sm
+		let session_handle = sm
 			.remove(session_id_str)
 			.ok_or_else(|| (StatusCode::NOT_FOUND, "Session not found".to_string()).into_response())?;
 
-		match session.cancel().await {
+		match session_handle.close().await {
 			Ok(quit_reason) => {
 				tracing::info!(%session_id, ?quit_reason, "/mcp session deleted successfully");
 				Ok(StatusCode::ACCEPTED)

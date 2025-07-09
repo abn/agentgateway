@@ -453,7 +453,12 @@ impl Listener {
 				.inspect_err(|e| {
 					tracing::error!("serving error: {:?}", e);
 				})
-				.map_err(ServingError::Io)?;
+				.map_err(|e: rmcp::service::ServerInitializeError<std::io::Error>| {
+					match e {
+						rmcp::service::ServerInitializeError::TransportError { error: io_err, .. } => ServingError::Io(io_err),
+						_ => ServingError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+					}
+				})?;
 				Ok(BoundListener::Stdio(BoundStdioListener { listener: relay }))
 			},
 		}

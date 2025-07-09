@@ -5,15 +5,15 @@ use crate::rbac;
 use crate::trcng;
 use crate::xds::XdsStore;
 use agent_core::metrics::Recorder;
-use http::HeaderName;
-use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+// use http::HeaderName; // unused
+// use http::{HeaderMap, HeaderValue, header::AUTHORIZATION}; // unused
 use itertools::Itertools;
-use opentelemetry::trace::Tracer;
+// use opentelemetry::trace::Tracer; // unused
 use opentelemetry::{Context, trace::SpanKind};
 use rmcp::RoleClient;
 use rmcp::service::RunningService;
 use rmcp::transport::child_process::TokioChildProcess;
-use rmcp::transport::sse::SseTransport;
+// use rmcp::transport::SseClientTransport; // unused
 use rmcp::{
 	Error as McpError, RoleServer, ServerHandler, model::CallToolRequestParam, model::Tool, model::*,
 	service::RequestContext,
@@ -22,7 +22,7 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::process::Command;
+// use tokio::process::Command; // unused
 use tokio::sync::RwLock;
 use tracing::instrument;
 pub mod metrics;

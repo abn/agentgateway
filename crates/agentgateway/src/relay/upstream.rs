@@ -15,7 +15,8 @@ impl UpstreamError {
 					reason.clone().unwrap_or("cancelled".to_string())
 				},
 				rmcp::ServiceError::UnexpectedResponse => "unexpected_response".to_string(),
-				rmcp::ServiceError::Transport(_) => "transport_error".to_string(),
+				rmcp::ServiceError::TransportSend(_) => "transport_send_error".to_string(),
+				rmcp::ServiceError::TransportClosed => "transport_closed_error".to_string(),
 				_ => "unknown".to_string(),
 			},
 			Self::OpenAPIError(_) => "openapi_error".to_string(),
@@ -50,7 +51,8 @@ impl From<UpstreamError> for ErrorData {
 				rmcp::ServiceError::UnexpectedResponse => {
 					ErrorData::internal_error("unexpected response", None)
 				},
-				rmcp::ServiceError::Transport(e) => ErrorData::internal_error(e.to_string(), None),
+				rmcp::ServiceError::TransportSend(e) => ErrorData::internal_error(e.to_string(), None),
+				rmcp::ServiceError::TransportClosed => ErrorData::internal_error("transport_closed".to_string(), None),
 				_ => ErrorData::internal_error("unknown error", None),
 			},
 		}
